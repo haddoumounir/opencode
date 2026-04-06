@@ -11,6 +11,7 @@ export namespace SessionStatus {
     .union([
       z.object({
         type: z.literal("idle"),
+        suggestion: z.string().optional(),
       }),
       z.object({
         type: z.literal("retry"),
@@ -48,6 +49,7 @@ export namespace SessionStatus {
     readonly get: (sessionID: SessionID) => Effect.Effect<Info>
     readonly list: () => Effect.Effect<Map<SessionID, Info>>
     readonly set: (sessionID: SessionID, status: Info) => Effect.Effect<void>
+    readonly suggest: (sessionID: SessionID, suggestion: string) => Effect.Effect<void>
   }
 
   export class Service extends ServiceMap.Service<Service, Interface>()("@opencode/SessionStatus") {}
@@ -81,7 +83,17 @@ export namespace SessionStatus {
         data.set(sessionID, status)
       })
 
-      return Service.of({ get, list, set })
+      const suggest = Effect.fn("SessionStatus.suggest")(function* (sessionID: SessionID, suggestion: string) {
+        const data = yield* InstanceState.get(state)
+        const current = data.get(sessionID)
+        if (current && current.type !== "idle") return
+        const status: Info = { type: "idle", suggestion }
+        // only publish Status so the TUI sees the suggestion;
+        // skip Event.Idle to avoid spurious plugin notifications
+        yield* bus.publish(Event.Status, { sessionID, status })
+      })
+
+      return Service.of({ get, list, set, suggest })
     }),
   )
 
@@ -98,5 +110,9 @@ export namespace SessionStatus {
 
   export async function set(sessionID: SessionID, status: Info) {
     return runPromise((svc) => svc.set(sessionID, status))
+  }
+
+  export async function suggest(sessionID: SessionID, suggestion: string) {
+    return runPromise((svc) => svc.suggest(sessionID, suggestion))
   }
 }

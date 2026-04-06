@@ -20,6 +20,7 @@ import { Plugin } from "../plugin"
 import PROMPT_PLAN from "../session/prompt/plan.txt"
 import BUILD_SWITCH from "../session/prompt/build-switch.txt"
 import MAX_STEPS from "../session/prompt/max-steps.txt"
+import PROMPT_SUGGEST_NEXT from "../session/prompt/suggest-next.txt"
 import { ToolRegistry } from "../tool/registry"
 import { Runner } from "@/effect/runner"
 import { MCP } from "../mcp"
@@ -250,6 +251,80 @@ export namespace SessionPrompt {
               Effect.sync(() => log.error("failed to generate title", { error: Cause.squash(cause) })),
             ),
           )
+      })
+
+      const suggest = Effect.fn("SessionPrompt.suggest")(function* (input: {
+        session: Session.Info
+        sessionID: SessionID
+        message: MessageV2.WithParts
+      }) {
+        if (input.session.parentID) return
+        const message = input.message.info
+        if (message.role !== "assistant") return
+        if (message.error) return
+        if (!message.finish) return
+        if (["tool-calls", "unknown"].includes(message.finish)) return
+        if ((yield* status.get(input.sessionID)).type !== "idle") return
+
+        // Use the same model for prompt-cache hit on the conversation prefix
+        const model = yield* Effect.promise(async () =>
+          Provider.getModel(message.providerID, message.modelID).catch(() => undefined),
+        )
+        if (!model) return
+
+        const ag = yield* agents.get(message.agent ?? "code")
+        if (!ag) return
+
+        // Full message history so the cached KV from the main conversation is reused
+        const msgs = yield* MessageV2.filterCompactedEffect(input.sessionID)
+        const real = (item: MessageV2.WithParts) =>
+          item.info.role === "user" && !item.parts.every((part) => "synthetic" in part && part.synthetic)
+        const parent = msgs.find((item) => item.info.id === message.parentID)
+        const user = parent && real(parent) ? parent.info : msgs.findLast((item) => real(item))?.info
+        if (!user || user.role !== "user") return
+
+        // Rebuild system prompt identical to the main loop for cache hit
+        const skills = yield* Effect.promise(() => SystemPrompt.skills(ag))
+        const env = yield* Effect.promise(() => SystemPrompt.environment(model))
+        const instructions = yield* instruction.system().pipe(Effect.orDie)
+        const modelMsgs = yield* Effect.promise(() => MessageV2.toModelMessages(msgs, model))
+        const system = [...env, ...(skills ? [skills] : []), ...instructions]
+
+        const text = yield* Effect.promise(async (signal) => {
+          const result = await LLM.stream({
+            agent: ag,
+            user,
+            system,
+            small: false,
+            tools: {},
+            model,
+            abort: signal,
+            sessionID: input.sessionID,
+            retries: 1,
+            toolChoice: "none",
+            // Append suggestion instruction after the full conversation
+            messages: [...modelMsgs, { role: "user" as const, content: PROMPT_SUGGEST_NEXT }],
+          })
+          return result.text
+        })
+
+        const line = text
+          .replace(/<think>[\s\S]*?<\/think>\s*/g, "")
+          .split("\n")
+          .map((item) => item.trim())
+          .find((item) => item.length > 0)
+          ?.replace(/^["'`]+|["'`]+$/g, "")
+        if (!line) return
+
+        const tag = line
+          .toUpperCase()
+          .replace(/[\s-]+/g, "_")
+          .replace(/[^A-Z_]/g, "")
+        if (tag === "NO_SUGGESTION") return
+
+        const suggestion = line.length > 240 ? line.slice(0, 237) + "..." : line
+        if ((yield* status.get(input.sessionID)).type !== "idle") return
+        yield* status.suggest(input.sessionID, suggestion)
       })
 
       const insertReminders = Effect.fn("SessionPrompt.insertReminders")(function* (input: {
@@ -1322,7 +1397,15 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           }
 
           if (input.noReply === true) return message
-          return yield* loop({ sessionID: input.sessionID })
+          const result = yield* loop({ sessionID: input.sessionID })
+          if (Flag.OPENCODE_EXPERIMENTAL_NEXT_PROMPT) {
+            yield* suggest({
+              session,
+              sessionID: input.sessionID,
+              message: result,
+            }).pipe(Effect.ignore, Effect.forkIn(scope))
+          }
+          return result
         },
       )
 
