@@ -44,12 +44,16 @@ console.log(`Loaded ${migrations.length} migrations`)
 await Bun.build({
   target: "node",
   entrypoints: ["./src/node.ts"],
-  outdir: "./dist",
+  outdir: "./dist/node",
   format: "esm",
-  external: ["jsonc-parser"],
+  sourcemap: "linked",
+  external: ["jsonc-parser", "@lydell/node-pty"],
   define: {
     OPENCODE_MIGRATIONS: JSON.stringify(migrations),
     OPENCODE_CHANNEL: `'${Script.channel}'`,
+  },
+  files: {
+    "opencode-web-ui.gen.ts": "",
   },
 })
 
